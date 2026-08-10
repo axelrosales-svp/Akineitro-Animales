@@ -4,6 +4,7 @@ import math
 import struct
 import json
 import gc
+import array
 import ssd1306
 
 print("=== Sistema de Calibración Bidimensional de Voz (SI / NO) ===")
