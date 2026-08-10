@@ -1,87 +1,87 @@
 # akinator_animales.py
 # ---------------------
-# Versión con atenuación de pico anti-saturación mecánica (45% volumen máximo)
-# para que las pequeñas bocinas de 1W/2W del kit suenen suaves, nítidas y sin carraspeos.
+# Versión optimizada con procesamiento espectral de voz en tiempo real.
+# Clasifica las palabras "SI" y "NO" mediante análisis de frecuencias.
 
 import struct
 import time
 import os
 import sys
 import gc
+import json
 import micropython
 import network
-from machine import I2S, I2C, Pin, ADC, SoftI2C
+from machine import I2S, Pin, SoftI2C, ADC
 import ssd1306
 
 gc.collect()
 
-# ==========================================
-# 0. APAGAR WIFI PARA PREVENIR RUIDO RF
-# ==========================================
+# Apagar WiFi para evitar ruido electromagnético de fondo en el audio
 try:
-    wlan_ap = network.WLAN(network.AP_IF)
-    wlan_ap.active(False)
-    wlan_sta = network.WLAN(network.STA_IF)
-    wlan_sta.active(False)
+    network.WLAN(network.AP_IF).active(False)
+    network.WLAN(network.STA_IF).active(False)
 except:
     pass
 
 # ==========================================
 # 1. CONFIGURACIÓN DE PINES Y HARDWARE
 # ==========================================
+OLED_SDA = 8
+OLED_SCL = 9
+MIC_SCK = 15
+MIC_WS = 7
+MIC_SD = 16
+AMP_SCK = 5
+AMP_WS = 4
+AMP_SD = 6
 
-# Pantalla OLED con SoftI2C a 100kHz
 i2c = None
 oled = None
 try:
-    i2c = SoftI2C(scl=Pin(9), sda=Pin(8), freq=100000)
+    i2c = SoftI2C(scl=Pin(OLED_SCL), sda=Pin(OLED_SDA), freq=100000)
     oled = ssd1306.SSD1306_I2C(128, 64, i2c)
 except:
     pass
 
-# Micrófono INMP441 (I2S 1 RX, 32-bits Estéreo, ibuf=4096)
+# Micrófono I2S (I2S 1 RX, Estéreo, 32-bits)
 audio_in = I2S(
-    1, sck=Pin(15), ws=Pin(7), sd=Pin(16),
-    mode=I2S.RX, bits=32, format=I2S.STEREO, rate=16000, ibuf=4096
+    1, sck=Pin(MIC_SCK), ws=Pin(MIC_WS), sd=Pin(MIC_SD),
+    mode=I2S.RX, bits=32, format=I2S.STEREO, rate=16000, ibuf=8000
 )
 
-# Bocina MAX98357A (I2S 0 TX, 16-bits STEREO para reloj BCLK 32x exacto)
+# Bocina MAX98357A (I2S 0 TX, 16-bits MONO)
 audio_out = I2S(
-    0, sck=Pin(5), ws=Pin(4), sd=Pin(6),
-    mode=I2S.TX, bits=16, format=I2S.STEREO, rate=16000, ibuf=8192
+    0, sck=Pin(AMP_SCK), ws=Pin(AMP_WS), sd=Pin(AMP_SD),
+    mode=I2S.TX, bits=16, format=I2S.MONO, rate=16000, ibuf=8192
 )
 
-# Potenciómetro para control de volumen (GPIO 2)
-pot = ADC(Pin(2))
-pot.atten(ADC.ATTN_11DB)
-
 # ==========================================
-# 2. CONFIGURACIÓN Y AJUSTES DE VOZ
+# 2. CONFIGURACIÓN DE AUDIO Y PARÁMETROS
 # ==========================================
-MIC_CHANNEL = 0             # 0 = Izquierdo (GND), 1 = Derecho (VCC)
-MIC_SHIFT = 12              # GANANCIA DE MICRÓFONO (16x boost)
-TIMEOUT_SEGUNDOS = 5        # Ventana máxima de 5 segundos para responder
-TIEMPO_SILENCIO_FIN = 300   # Silencio post-habla (ms) para cortar grabación
+MIC_CHANNEL = 0
+MIC_SHIFT = 14
 
-DURACION_MINIMA_VOZ = 160   # Ruidos < 160ms se descartan
-LIMITE_DURACION_SI_NO = 320 # < 320ms es "NO" (corto), >= 320ms es "SÍ" (largo SÍII)
-
-# Búferes estáticos pre-asignados
-MONO_READ_BUF = bytearray(1024)
-STEREO_PLAY_BUF = bytearray(2048)
+MONO_READ_BUF = bytearray(4096)
 MIC_FLUSH_BUF = bytearray(1600)
-DSP_MIC_BUF = bytearray(800)
+DSP_MIC_BUF = bytearray(1024)
+
+# Carga de parámetros de calibración de voz
+umbral_zcr_corte = 8.0 # Valor por defecto
+try:
+    with open("config_voz.json", "r") as f:
+        config = json.load(f)
+        umbral_zcr_corte = config["umbral_zcr"]
+    print(f"Calibración de voz cargada. Umbral de corte: {umbral_zcr_corte:.2f}%")
+except Exception:
+    print("No se encontró 'config_voz.json'. Usando umbral por defecto (8.0%)")
 
 # ==========================================
 # 3. INTERFAZ GRÁFICA DE CONSOLA Y OLED
 # ==========================================
-
 def enviar_telemetria_gui(evento, detalle=""):
-    """Envía comandos estructurados por el puerto serie para actualizar la GUI de la PC."""
     sys.stdout.write(f"[GUI_EVENT]:{evento}:{detalle}\n")
 
 def mostrar(titulo, linea1="", linea2=""):
-    """Dibuja en la pantalla OLED y transmite el evento a la GUI."""
     if oled:
         try:
             oled.fill(0)
@@ -92,11 +92,9 @@ def mostrar(titulo, linea1="", linea2=""):
             oled.show()
         except:
             pass
-
     enviar_telemetria_gui("OLED", f"{titulo}|{linea1}|{linea2}")
 
 def mostrar_texto_largo(titulo, texto):
-    """Empaca texto largo para la OLED e imprime en la consola."""
     if oled:
         try:
             oled.fill(0)
@@ -137,55 +135,64 @@ def mostrar_texto_largo(titulo, texto):
 # ==========================================
 # 4. DSP ACELERADO POR HARDWARE (VIPER)
 # ==========================================
-
 @micropython.viper
-def expand_mono16_to_stereo16_and_scale(src_mono: ptr16, dest_stereo: ptr16, num_samples: int, vol_fp: int):
-    """Aplica escala de volumen suave (máximo 45%) para evitar distorsión mecánica en la bocina."""
+def scale_mono_volume(buf: ptr16, num_samples: int, vol_fp: int):
     i = 0
     while i < num_samples:
-        s16 = src_mono[i]
+        val_un = int(buf[i])
+        if val_un > 32767:
+            s16 = val_un - 65536
+        else:
+            s16 = val_un
+            
         val = (s16 * vol_fp) >> 8
+        
         if val > 32767:
             val = 32767
         elif val < -32768:
             val = -32768
-        
-        idx_st = i << 1
-        dest_stereo[idx_st] = val
-        dest_stereo[idx_st + 1] = val
+            
+        if val < 0:
+            val += 65536
+            
+        buf[i] = val
         i += 1
 
 @micropython.viper
-def get_max_amplitude_stereo(src_32: ptr32, length: int, channel: int) -> int:
-    """Extrae el canal seleccionado y calcula la amplitud máxima en C nativo."""
+def analyze_frame_mics(src_32: ptr32, length: int, channel: int, shift_val: int) -> int:
     i = 0
-    max_val = 0
-    shift_val = int(MIC_SHIFT)
+    zcr = 0
+    max_amp = 0
+    prev_val = 0
+    
     while i < length:
         s32 = src_32[(i << 1) + channel]
-        s_amp = s32 >> shift_val
-        if s_amp < 0:
-            s_amp = -s_amp
-        if s_amp > max_val:
-            max_val = s_amp
+        s16 = s32 >> shift_val
+        
+        # Obtener amplitud
+        amp = s16
+        if amp < 0:
+            amp = -amp
+        if amp > max_amp:
+            max_amp = amp
+            
+        # Contar cruces por cero (ZCR)
+        if (prev_val >= 0 and s16 < 0) or (prev_val < 0 and s16 >= 0):
+            zcr += 1
+            
+        prev_val = s16
         i += 1
-    return max_val
+        
+    return (max_amp << 16) | zcr
 
 # ==========================================
-# 5. FUNCIONES DE REPRODUCCIÓN Y DETECCIÓN
+# 5. FUNCIONES DE AUDIO Y DETECCIÓN
 # ==========================================
-
 def leer_volumen_potenciometro_fp():
-    """Mapea el potenciómetro de 10% (25) a 45% (115) para evitar saturación de la bocina."""
-    try:
-        valor_crudo = pot.read()
-        vol_fp = 25 + (valor_crudo * 90) // 4095
-    except:
-        vol_fp = 95 # 37% de volumen seguro y nítido
-    return vol_fp
+    # Retorna un volumen del 41% (105 de 256) constante y limpio
+    return 105
 
 def reproducir_wav(archivo):
-    """Reproduce un archivo WAV de /audios_akinator/ con volumen controlado anti-saturación."""
     ruta_completa = "/audios_akinator/" + archivo
     enviar_telemetria_gui("AUDIO", archivo)
     gc.collect()
@@ -200,107 +207,98 @@ def reproducir_wav(archivo):
                     break
                 
                 num_muestras = bytes_read // 2
-                expand_mono16_to_stereo16_and_scale(MONO_READ_BUF, STEREO_PLAY_BUF, num_muestras, vol_fp)
-                
-                bytes_to_write = num_muestras * 4
-                audio_out.write(STEREO_PLAY_BUF[:bytes_to_write])
+                scale_mono_volume(MONO_READ_BUF, num_muestras, vol_fp)
+                audio_out.write(MONO_READ_BUF[:bytes_read])
                     
-        time.sleep_ms(800)
+        time.sleep_ms(400)
 
     except OSError:
         enviar_telemetria_gui("ERROR", f"No se encontro {ruta_completa}")
         time.sleep(1)
 
 def vaciar_buffer_mic():
-    """Descarta muestras viejas del micrófono I2S."""
     try:
-        for _ in range(40):
+        for _ in range(30):
             audio_in.readinto(MIC_FLUSH_BUF)
     except:
         pass
 
 def calibrar_ruido():
-    """Mide el ruido ambiente y calcula un umbral de seguridad mínimo de 2500."""
-    mostrar("CALIBRANDO...", "Guarda silencio", "midiendo salon")
+    mostrar("CALIBRANDO...", "Guarda silencio", "midiendo...")
     reproducir_wav("calibrando.wav")
     vaciar_buffer_mic()
 
     lecturas = []
-    
-    for _ in range(30):
+    for _ in range(20):
         num_bytes = audio_in.readinto(DSP_MIC_BUF)
         if num_bytes > 0:
-            max_amp = get_max_amplitude_stereo(DSP_MIC_BUF, num_bytes // 8, MIC_CHANNEL)
+            res = analyze_frame_mics(DSP_MIC_BUF, num_bytes // 8, MIC_CHANNEL, MIC_SHIFT)
+            max_amp = res >> 16
             lecturas.append(max_amp)
         time.sleep(0.1)
 
     ruido_base = sum(lecturas) // len(lecturas) if lecturas else 400
-    umbral = max(ruido_base * 3, 2500)
+    umbral = max(ruido_base * 3, 2000)
 
-    enviar_telemetria_gui("CALIBRACION", f"Base={ruido_base},Umbral={umbral}")
-    mostrar("LISTO", f"Base: {ruido_base}", f"Umbral: {umbral}")
-    time.sleep(1.5)
+    mostrar("LISTO", "Prepara tu voz", "")
+    time.sleep(1)
     return umbral
 
-def escuchar_si_no(umbral):
-    """Escucha la respuesta durante 5 segundos con inmunidad a siseos de fondo."""
+def escuchar_si_no(umbral_energia):
     vaciar_buffer_mic()
     enviar_telemetria_gui("ESTADO", "ESCUCHANDO")
 
-    inicio_escucha_ms = time.ticks_ms()
-    inicio_voz = 0
-    fin_voz = 0
+    inicio_escucha = time.time()
     hablando = False
-    umbral_silencio = umbral * 0.6
+    
+    total_zcr = 0
+    total_muestras = 0
     ultimo_segundo_mostrado = -1
 
-    while True:
-        transcurrido_ms = time.ticks_diff(time.ticks_ms(), inicio_escucha_ms)
-        segundos_restantes = 5 - (transcurrido_ms // 1000)
-
-        if segundos_restantes <= 0 and not hablando:
-            break
+    while time.time() - inicio_escucha < 5:
+        transcurrido = int(time.time() - inicio_escucha)
+        segundos_restantes = 5 - transcurrido
 
         if not hablando and segundos_restantes != ultimo_segundo_mostrado:
             ultimo_segundo_mostrado = segundos_restantes
-            mostrar("RESPONDE AHORA", f"Tiempo: {segundos_restantes}s", "SI (largo)/NO(corto)")
+            mostrar("RESPONDE AHORA", f"Tiempo: {segundos_restantes}s", "Di SI o NO")
             enviar_telemetria_gui("RELOJ", str(segundos_restantes))
 
         num_bytes = audio_in.readinto(DSP_MIC_BUF)
         if num_bytes > 0:
-            if transcurrido_ms < 300:
-                continue
+            samples_read = num_bytes // 8
+            res = analyze_frame_mics(DSP_MIC_BUF, samples_read, MIC_CHANNEL, MIC_SHIFT)
+            amp = res >> 16
+            zcr = res & 0xFFFF
 
-            max_amp = get_max_amplitude_stereo(DSP_MIC_BUF, num_bytes // 8, MIC_CHANNEL)
-
-            if max_amp > umbral and not hablando:
+            # Si el volumen de voz supera el umbral de ruido, empezamos a grabar
+            if amp > umbral_energia and not hablando:
                 hablando = True
-                inicio_voz = time.ticks_ms()
-                fin_voz = inicio_voz
-                enviar_telemetria_gui("ESTADO", "GRABANDO")
-                mostrar("GRABANDO...", "Midiendo", "duracion voz...")
+                total_zcr = 0
+                total_muestras = 0
+                mostrar("PROCESANDO...", "Sigue hablando")
+                print("-> Grabando voz...")
 
-            elif hablando:
-                if max_amp > umbral_silencio:
-                    fin_voz = time.ticks_ms()
+            if hablando:
+                total_zcr += zcr
+                total_muestras += samples_read
 
-                if time.ticks_diff(time.ticks_ms(), fin_voz) > TIEMPO_SILENCIO_FIN:
-                    duracion = time.ticks_diff(fin_voz, inicio_voz)
+                # Analizar ventana de 1.2 segundos (19,200 muestras)
+                if total_muestras >= 19200:
+                    zcr_percent = (total_zcr / total_muestras) * 100
+                    print(f"-> Analizado ZCR: {zcr_percent:.2f}%")
 
-                    if duracion < DURACION_MINIMA_VOZ:
-                        hablando = False
-                        enviar_telemetria_gui("ESTADO", "ESCUCHANDO")
-                        mostrar("RESPONDE AHORA", f"Tiempo: {segundos_restantes}s", "Intenta de nuevo")
-                        continue
-
-                    if duracion < LIMITE_DURACION_SI_NO:
-                        sys.stdout.write(f"🎙️ [Voz]: {duracion}ms -> Clasificado como 'NO'\n")
-                        enviar_telemetria_gui("RESPUESTA", "NO")
-                        return "no"
-                    else:
-                        sys.stdout.write(f"🎙️ [Voz]: {duracion}ms -> Clasificado como 'SÍ'\n")
+                    # Clasificación final
+                    if zcr_percent > umbral_zcr_corte:
+                        mostrar("RESPUESTA:", "SI")
                         enviar_telemetria_gui("RESPUESTA", "SI")
+                        time.sleep(1.5)
                         return "si"
+                    else:
+                        mostrar("RESPUESTA:", "NO")
+                        enviar_telemetria_gui("RESPUESTA", "NO")
+                        time.sleep(1.5)
+                        return "no"
 
         time.sleep_ms(2)
 
@@ -308,9 +306,8 @@ def escuchar_si_no(umbral):
     return None
 
 # ==========================================
-# 6. ARBOL DE DECISION (7 animales)
+# 6. ARBOL DE DECISIÓN
 # ==========================================
-
 ARBOL_ANIMALES = {
     "pregunta": "es_domestico",
     "si": {
@@ -368,7 +365,6 @@ AUDIO_RESULTADO = {
 # ==========================================
 # 7. FLUJO PRINCIPAL DEL JUEGO
 # ==========================================
-
 try:
     enviar_telemetria_gui("SISTEMA", "INICIADO")
 
@@ -376,7 +372,6 @@ try:
     reproducir_wav("bienvenida.wav")
 
     UMBRAL = calibrar_ruido()
-
     nodo_actual = ARBOL_ANIMALES
 
     while "animal" not in nodo_actual:
@@ -393,7 +388,7 @@ try:
             mostrar("NO ESCUCHE", "Intenta de", "nuevo...")
             reproducir_wav("no_escuche.wav")
             time.sleep(1)
-            continue  # Repite la misma pregunta
+            continue
 
         nodo_actual = nodo_actual[respuesta]
 
@@ -406,11 +401,7 @@ try:
     mostrar("FIN", "Gracias por", "jugar!")
 
 except KeyboardInterrupt:
-    audio_in.deinit()
-    audio_out.deinit()
     mostrar("SISTEMA", "APAGADO", "")
-
-except Exception as e:
+finally:
     audio_in.deinit()
     audio_out.deinit()
-    mostrar("ERROR", str(e))
