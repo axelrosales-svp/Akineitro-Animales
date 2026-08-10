@@ -1,8 +1,7 @@
 # akinator_animales.py
 # ---------------------
-# Versión optimizada con procesamiento espectral de voz en dos dimensiones.
-# Clasifica las palabras "SI" y "NO" comparando las características
-# de la voz con los perfiles calibrados del usuario.
+# Versión optimizada con procesamiento espectral de picos en ventanas de 100ms.
+# Clasifica las respuestas "SI" y "NO" analizando el pico máximo de frecuencias.
 
 import struct
 import time
@@ -11,7 +10,6 @@ import sys
 import gc
 import json
 import math
-import array
 import micropython
 import network
 from machine import I2S, Pin, SoftI2C, ADC
@@ -19,7 +17,7 @@ import ssd1306
 
 gc.collect()
 
-# Apagar WiFi para evitar ruido de fondo electromagnético
+# Apagar WiFi para evitar ruido electromagnético
 try:
     network.WLAN(network.AP_IF).active(False)
     network.WLAN(network.STA_IF).active(False)
@@ -66,12 +64,9 @@ MIC_SHIFT = 14
 
 MONO_READ_BUF = bytearray(4096)
 MIC_FLUSH_BUF = bytearray(1600)
-DSP_MIC_BUF = bytearray(1024)
+DSP_MIC_BUF = bytearray(1600 * 8) # Buffer de 100ms de audio estéreo 32bits
 
-# Array para resultados DSP acelerados: [zcr, hi_energy, lo_energy]
-dsp_results = array.array('i', [0, 0, 0])
-
-# Cargar centroides de calibración de voz
+# Cargar perfiles de calibración de picos
 si_zcr, si_hlr = 12.0, 8.0  # Valores por defecto para SÍ
 no_zcr, no_hlr = 4.0, 2.0   # Valores por defecto para NO
 
@@ -82,9 +77,9 @@ try:
         si_hlr = config["si_hlr"]
         no_zcr = config["no_zcr"]
         no_hlr = config["no_hlr"]
-    print("Perfiles de calibración de voz cargados:")
-    print(f"  SI ➡ ZCR: {si_zcr:.1f}%, HLR: {si_hlr:.1f}")
-    print(f"  NO ➡ ZCR: {no_zcr:.1f}%, HLR: {no_hlr:.1f}")
+    print("Perfiles de calibración de pico cargados:")
+    print(f"  SI ➡ ZCR Pico: {si_zcr:.1f}%, Energia Pico: {si_hlr:.1f}")
+    print(f"  NO ➡ ZCR Pico: {no_zcr:.1f}%, Energia Pico: {no_hlr:.1f}")
 except Exception:
     print("No se encontró 'config_voz.json'. Usando configuración de respaldo.")
 
@@ -171,61 +166,89 @@ def scale_mono_volume(buf: ptr16, num_samples: int, vol_fp: int):
         i += 1
 
 @micropython.viper
-def extract_dsp_features(src_32: ptr32, length: int, channel: int, shift_val: int, res: ptr32):
+def analyze_block_dsp(src_32: ptr32, length: int, channel: int, shift_val: int) -> int:
+    # 1. Promedio DC
+    i = 0
+    total = 0
+    while i < length:
+        s32 = src_32[(i << 1) + channel]
+        s16 = s32 >> shift_val
+        if s16 > 32767:
+            s16 = 32767
+        elif s16 < -32768:
+            s16 = -32768
+        total += s16
+        i += 1
+    avg = total // length
+    
+    # 2. ZCR y Energía paso alto (diferencias)
     i = 0
     zcr = 0
     hi_energy = 0
-    lo_energy = 0
     prev_val = 0
+    gate_threshold = 800
     
     while i < length:
         s32 = src_32[(i << 1) + channel]
         s16 = s32 >> shift_val
-        
         if s16 > 32767:
             s16 = 32767
         elif s16 < -32768:
             s16 = -32768
             
-        # Cruces por cero
-        if (prev_val >= 0 and s16 < 0) or (prev_val < 0 and s16 >= 0):
-            zcr += 1
+        s16_clean = s16 - avg
+        amp = s16_clean
+        if amp < 0:
+            amp = -amp
             
-        # Filtro Paso Alto
-        diff = s16 - prev_val
-        if diff < 0:
-            hi_energy += -diff
-        else:
-            hi_energy += diff
-            
-        # Filtro Paso Bajo
-        summ = s16 + prev_val
-        if summ < 0:
-            lo_energy += -summ
-        else:
-            lo_energy += summ
-            
-        prev_val = s16
+        if amp > gate_threshold:
+            # Cruce por cero
+            if (prev_val >= 0 and s16_clean < 0) or (prev_val < 0 and s16_clean >= 0):
+                zcr += 1
+                
+            # Filtro Paso Alto (Diferencia)
+            diff = s16_clean - prev_val
+            if diff < 0:
+                hi_energy += -diff
+            else:
+                hi_energy += diff
+                
+        prev_val = s16_clean
         i += 1
         
-    res[0] = res[0] + zcr
-    res[1] = res[1] + hi_energy
-    res[2] = res[2] + lo_energy
+    return (hi_energy << 16) | zcr
 
 @micropython.viper
-def get_amplitude_only(src_32: ptr32, length: int, channel: int, shift_val: int) -> int:
+def get_block_mav(src_32: ptr32, length: int, channel: int, shift_val: int) -> int:
     i = 0
-    max_amp = 0
+    total = 0
     while i < length:
         s32 = src_32[(i << 1) + channel]
         s16 = s32 >> shift_val
-        amp = s16
-        if amp < 0:
-            amp = -amp
-        if amp > max_amp:
-            max_amp = amp
+        if s16 > 32767:
+            s16 = 32767
+        elif s16 < -32768:
+            s16 = -32768
+        total += s16
         i += 1
-    return max_amp
+    avg = total // length
+    
+    i = 0
+    sum_abs = 0
+    while i < length:
+        s32 = src_32[(i << 1) + channel]
+        s16 = s32 >> shift_val
+        if s16 > 32767:
+            s16 = 32767
+        elif s16 < -32768:
+            s16 = -32768
+        amp = s16 - avg
+        if amp < 0:
+            sum_abs += -amp
+        else:
+            sum_abs += amp
+        i += 1
+    return sum_abs // length
 
 # ==========================================
 # 5. FUNCIONES DE REPRODUCCIÓN Y DETECCIÓN
@@ -265,14 +288,15 @@ def calibrar_ruido():
     reproducir_wav("calibrando.wav")
     vaciar_buffer_mic()
     lecturas = []
+    temp_cal_buf = bytearray(1024)
     for _ in range(20):
-        num_bytes = audio_in.readinto(DSP_MIC_BUF)
+        num_bytes = audio_in.readinto(temp_cal_buf)
         if num_bytes > 0:
-            amp = get_amplitude_only(DSP_MIC_BUF, num_bytes // 8, MIC_CHANNEL, MIC_SHIFT)
-            lecturas.append(amp)
+            mav = get_block_mav(temp_cal_buf, num_bytes // 8, MIC_CHANNEL, MIC_SHIFT)
+            lecturas.append(mav)
         time.sleep(0.1)
-    ruido_base = sum(lecturas) // len(lecturas) if lecturas else 400
-    umbral = max(ruido_base * 3, 2000)
+    ruido_base = sum(lecturas) // len(lecturas) if lecturas else 100
+    umbral = max(ruido_base * 3, 500)
     mostrar("LISTO", "Prepara tu voz", "")
     time.sleep(1)
     return umbral
@@ -284,12 +308,9 @@ def escuchar_si_no(umbral_energia):
     inicio_escucha = time.time()
     hablando = False
     
-    # Reiniciar acumuladores dsp
-    dsp_results[0] = 0
-    dsp_results[1] = 0
-    dsp_results[2] = 0
+    pico_zcr = 0
+    pico_hi_energy = 0
     
-    total_muestras = 0
     ultimo_segundo_mostrado = -1
 
     while time.time() - inicio_escucha < 5:
@@ -305,35 +326,40 @@ def escuchar_si_no(umbral_energia):
         if num_bytes > 0:
             samples_read = num_bytes // 8
             
-            # Si no ha empezado a hablar, solo monitorear la amplitud
+            # Si no ha empezado a hablar, monitorear el MAV de esta trama de 100ms
             if not hablando:
-                amp = get_amplitude_only(DSP_MIC_BUF, samples_read, MIC_CHANNEL, MIC_SHIFT)
-                if amp > umbral_energia:
+                mav = get_block_mav(DSP_MIC_BUF, samples_read, MIC_CHANNEL, MIC_SHIFT)
+                if mav > umbral_energia:
                     hablando = True
-                    dsp_results[0] = 0
-                    dsp_results[1] = 0
-                    dsp_results[2] = 0
-                    total_muestras = 0
+                    # Procesar el bloque de inicio
+                    res = analyze_block_dsp(DSP_MIC_BUF, samples_read, MIC_CHANNEL, MIC_SHIFT)
+                    pico_zcr = res & 0xFFFF
+                    pico_hi_energy = res >> 16
                     mostrar("PROCESANDO...", "Sigue hablando")
-                    print("-> Analizando entrada de voz...")
-
-            if hablando:
-                # Extraer ZCR, energía alta y baja simultáneamente
-                extract_dsp_features(DSP_MIC_BUF, samples_read, MIC_CHANNEL, MIC_SHIFT, dsp_results)
-                total_muestras += samples_read
-
-                # Analizar ventana de 1.2 segundos (19,200 muestras)
-                if total_muestras >= 19200:
-                    zcr_percent = (dsp_results[0] / total_muestras) * 100
-                    hi = float(dsp_results[1])
-                    lo = float(dsp_results[2])
-                    hlr_ratio = (hi / lo * 10.0) if lo > 0 else 0.0
+                    print("-> Voz detectada. Analizando...")
                     
-                    print(f"-> Características leídas ➡ ZCR: {zcr_percent:.1f}%, HLR: {hlr_ratio:.1f}")
+                    # Grabar los siguientes 8 bloques de 100ms (800ms)
+                    for _ in range(8):
+                        num_bytes = audio_in.readinto(DSP_MIC_BUF)
+                        if num_bytes > 0:
+                            samples_read = num_bytes // 8
+                            res = analyze_block_dsp(DSP_MIC_BUF, samples_read, MIC_CHANNEL, MIC_SHIFT)
+                            z = res & 0xFFFF
+                            h = res >> 16
+                            if z > pico_zcr:
+                                pico_zcr = z
+                            if h > pico_hi_energy:
+                                pico_hi_energy = h
+                                
+                    # Convertir a porcentajes/escalas relativas estables
+                    zcr_percent = (pico_zcr / 1600) * 100
+                    hi_scaled = pico_hi_energy / 1600
+                    
+                    print(f"-> Picos detectados ➡ ZCR Pico: {zcr_percent:.1f}%, Energia Pico: {hi_scaled:.1f}")
 
-                    # Clasificador de Distancia Mínima en Espacio Bidimensional
-                    dist_si = math.sqrt((zcr_percent - si_zcr)**2 + (hlr_ratio - si_hlr)**2)
-                    dist_no = math.sqrt((zcr_percent - no_zcr)**2 + (hlr_ratio - no_hlr)**2)
+                    # Clasificador de Distancia Mínima en 2D Estable
+                    dist_si = math.sqrt((zcr_percent - si_zcr)**2 + (hi_scaled - si_hlr)**2)
+                    dist_no = math.sqrt((zcr_percent - no_zcr)**2 + (hi_scaled - no_hlr)**2)
                     
                     print(f"-> Distancia a SI: {dist_si:.1f} | Distancia a NO: {dist_no:.1f}")
 
@@ -362,7 +388,7 @@ ARBOL_ANIMALES = {
         "pregunta": "ladra_mejor_amigo",
         "si": {"animal": "Perro"},
         "no": {
-            "pregunta": "hocico_plano_cola_rizada",
+            "pregunta": "hocico_chato_cola_rizada",
             "si": {"animal": "Cerdo"},
             "no": {"animal": "Burro"},
         },
@@ -385,7 +411,7 @@ ARBOL_ANIMALES = {
 TEXTOS_PREGUNTA = {
     "es_domestico": "Es un animal domestico o de granja?",
     "ladra_mejor_amigo": "Es mascota que ladra y es el mejor amigo del hombre?",
-    "hocico_plano_cola_rizada": "Tiene hocico plano y cola rizada?",
+    "hocico_chato_cola_rizada": "Tiene hocico chato y cola rizada?",
     "orejas_largas_saltos": "Tiene orejas largas y se mueve a saltos?",
     "melena_sabana": "Es felino de sabana y el macho tiene melena?",
     "bambu_blanco_negro": "Es blanco y negro y come bambu?",
@@ -394,7 +420,7 @@ TEXTOS_PREGUNTA = {
 AUDIO_PREGUNTA = {
     "es_domestico": "p_domestico.wav",
     "ladra_mejor_amigo": "p_ladra.wav",
-    "hocico_plano_cola_rizada": "p_hocico.wav",
+    "hocico_chato_cola_rizada": "p_hocico.wav",
     "orejas_largas_saltos": "p_orejas.wav",
     "melena_sabana": "p_melena.wav",
     "bambu_blanco_negro": "p_bambu.wav",

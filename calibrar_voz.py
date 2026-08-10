@@ -7,7 +7,7 @@ import gc
 import array
 import ssd1306
 
-print("=== Sistema de Calibración Bidimensional de Voz (SI / NO) ===")
+print("=== Sistema de Calibración de Pico de Frecuencia (SI / NO) ===")
 
 # ==========================================
 # 1. HARDWARE
@@ -31,9 +31,6 @@ audio_in = I2S(
     1, sck=Pin(MIC_SCK), ws=Pin(MIC_WS), sd=Pin(MIC_SD),
     mode=I2S.RX, bits=32, format=I2S.STEREO, rate=16000, ibuf=8000
 )
-
-# Array para guardar resultados acumulados de Viper: [zcr, hi_energy, lo_energy]
-dsp_results = array.array('i', [0, 0, 0])
 
 # ==========================================
 # 2. MENSAJES Y TONOS
@@ -70,153 +67,251 @@ def emitir_beep(frecuencia=800, duracion_ms=150):
         pass
 
 # ==========================================
-# 3. DSP ACELERADO (Extracción de 2 características)
+# 3. DSP ACELERADO (Viper)
 # ==========================================
 @micropython.viper
-def extract_dsp_features(src_32: ptr32, length: int, channel: int, shift_val: int, res: ptr32):
+def analyze_block_dsp(src_32: ptr32, length: int, channel: int, shift_val: int) -> int:
     """
-    Calcula simultáneamente:
-    1. Cruces por cero (ZCR)
-    2. Energía de alta frecuencia (Filtro paso alto: diferencia)
-    3. Energía de baja frecuencia (Filtro paso bajo: suma)
+    Calcula el promedio (DC offset) y luego obtiene el ZCR y la energía de alta frecuencia.
+    Retorna (hi_energy << 16) | zcr.
     """
+    # 1. Promedio DC
+    i = 0
+    total = 0
+    while i < length:
+        s32 = src_32[(i << 1) + channel]
+        s16 = s32 >> shift_val
+        if s16 > 32767:
+            s16 = 32767
+        elif s16 < -32768:
+            s16 = -32768
+        total += s16
+        i += 1
+    avg = total // length
+    
+    # 2. ZCR y Energía paso alto (diferencias)
     i = 0
     zcr = 0
     hi_energy = 0
-    lo_energy = 0
     prev_val = 0
+    gate_threshold = 800
     
     while i < length:
         s32 = src_32[(i << 1) + channel]
         s16 = s32 >> shift_val
-        
         if s16 > 32767:
             s16 = 32767
         elif s16 < -32768:
             s16 = -32768
             
-        # Cruces por cero
-        if (prev_val >= 0 and s16 < 0) or (prev_val < 0 and s16 >= 0):
-            zcr += 1
+        s16_clean = s16 - avg
+        amp = s16_clean
+        if amp < 0:
+            amp = -amp
             
-        # Energía alta (Diferencia absoluta)
-        diff = s16 - prev_val
-        if diff < 0:
-            hi_energy += -diff
-        else:
-            hi_energy += diff
-            
-        # Energía baja (Suma absoluta)
-        summ = s16 + prev_val
-        if summ < 0:
-            lo_energy += -summ
-        else:
-            lo_energy += summ
-            
-        prev_val = s16
+        if amp > gate_threshold:
+            # Cruce por cero
+            if (prev_val >= 0 and s16_clean < 0) or (prev_val < 0 and s16_clean >= 0):
+                zcr += 1
+                
+            # Filtro Paso Alto (Diferencia)
+            diff = s16_clean - prev_val
+            if diff < 0:
+                hi_energy += -diff
+            else:
+                hi_energy += diff
+                
+        prev_val = s16_clean
         i += 1
         
-    res[0] = res[0] + zcr
-    res[1] = res[1] + hi_energy
-    res[2] = res[2] + lo_energy
+    return (hi_energy << 16) | zcr
 
-def grabar_muestra():
-    # Vaciar buffer
+@micropython.viper
+def get_block_mav(src_32: ptr32, length: int, channel: int, shift_val: int) -> int:
+    i = 0
+    total = 0
+    while i < length:
+        s32 = src_32[(i << 1) + channel]
+        s16 = s32 >> shift_val
+        if s16 > 32767:
+            s16 = 32767
+        elif s16 < -32768:
+            s16 = -32768
+        total += s16
+        i += 1
+    avg = total // length
+    
+    i = 0
+    sum_abs = 0
+    while i < length:
+        s32 = src_32[(i << 1) + channel]
+        s16 = s32 >> shift_val
+        if s16 > 32767:
+            s16 = 32767
+        elif s16 < -32768:
+            s16 = -32768
+        amp = s16 - avg
+        if amp < 0:
+            sum_abs += -amp
+        else:
+            sum_abs += amp
+        i += 1
+    return sum_abs // length
+
+# ==========================================
+# 4. CAPTURA DE AUDIO Y ANÁLISIS DE VENTANA MÁXIMA
+# ==========================================
+def grabar_y_obtener_picos(umbral_energia):
     flush = bytearray(1600)
     for _ in range(10):
         audio_in.readinto(flush)
         
-    # Grabamos durante 1.2 segundos (19,200 muestras)
-    duracion_muestras = 19200
-    temp_buf = bytearray(1024)
+    # Grabamos durante 1.0 segundo (16,000 muestras) en bloques de 100ms
+    temp_buf = bytearray(1600 * 8) # Buffer para 100ms
     
-    # Reiniciar acumuladores
-    dsp_results[0] = 0
-    dsp_results[1] = 0
-    dsp_results[2] = 0
+    pico_zcr = 0
+    pico_hi_energy = 0
     
-    muestras_leidas = 0
-    while muestras_leidas < duracion_muestras:
-        bytes_read = audio_in.readinto(temp_buf)
-        if bytes_read > 0:
-            samples_read = bytes_read // 8
-            extract_dsp_features(temp_buf, samples_read, 0, 14, dsp_results)
-            muestras_leidas += samples_read
+    hablando = False
+    inicio = time.time()
+    
+    # 1. Espera activa VAD
+    while time.time() - inicio < 4:
+        num_bytes = audio_in.readinto(temp_buf)
+        if num_bytes > 0:
+            samples_read = num_bytes // 8
+            mav = get_block_mav(temp_buf, samples_read, 0, 14)
+            if mav > umbral_energia:
+                hablando = True
+                # Procesar el primer bloque que activó la voz
+                res = analyze_block_dsp(temp_buf, samples_read, 0, 14)
+                pico_zcr = res & 0xFFFF
+                pico_hi_energy = res >> 16
+                break
+        time.sleep_ms(2)
+        
+    if not hablando:
+        return None
+        
+    # 2. Grabar los siguientes 8 bloques de 100ms cada uno (800ms restantes)
+    for _ in range(8):
+        num_bytes = audio_in.readinto(temp_buf)
+        if num_bytes > 0:
+            samples_read = num_bytes // 8
+            res = analyze_block_dsp(temp_buf, samples_read, 0, 14)
+            zcr = res & 0xFFFF
+            hi_energy = res >> 16
             
-    # Calcular características finales
-    zcr_percent = (dsp_results[0] / muestras_leidas) * 100
+            # Buscar el pico máximo (la sibilancia de la "S" será un pico clarísimo)
+            if zcr > pico_zcr:
+                pico_zcr = zcr
+            if hi_energy > pico_hi_energy:
+                pico_hi_energy = hi_energy
+                
+    # Convertir a porcentajes/escalas relativas estables
+    # pico_zcr representa el máximo de cruces en 1600 muestras (100ms)
+    zcr_percent = (pico_zcr / 1600) * 100
+    hi_scaled = pico_hi_energy / 1600
     
-    hi = float(dsp_results[1])
-    lo = float(dsp_results[2])
-    # Ratio alta/baja frecuencia (HLR) escalada por 10 para igualar pesos en el espacio euclidiano
-    hlr_ratio = (hi / lo * 10.0) if lo > 0 else 0.0
-    
-    return zcr_percent, hlr_ratio
+    return zcr_percent, hi_scaled
+
+def calibrar_ruido_inicial():
+    mostrar("CALIBRANDO RUIDO", "Guarda silencio")
+    time.sleep(0.5)
+    lecturas = []
+    temp_buf = bytearray(1024)
+    for _ in range(15):
+        num_bytes = audio_in.readinto(temp_buf)
+        if num_bytes > 0:
+            mav = get_block_mav(temp_buf, num_bytes // 8, 0, 14)
+            lecturas.append(mav)
+        time.sleep(0.1)
+    ruido_base = sum(lecturas) // len(lecturas) if lecturas else 100
+    return max(ruido_base * 3, 500)
 
 # ==========================================
-# 4. CAPTURA DE CALIBRACIÓN (5 veces cada palabra)
+# 5. BUCLE DE CALIBRACIÓN
 # ==========================================
-mostrar("Preparando...", "Espera")
+mostrar("Iniciando...", "Espera")
 time.sleep(1)
 
-muestras_si_zcr = []
-muestras_si_hlr = []
-muestras_no_zcr = []
-muestras_no_hlr = []
+umbral_ruido = calibrar_ruido_inicial()
+print(f"Umbral MAV para VAD: {umbral_ruido}")
 
-# Calibración para SÍ
-for j in range(5):
+muestras_si_zcr = []
+muestras_si_hi = []
+muestras_no_zcr = []
+muestras_no_hi = []
+
+# Calibrar SÍ
+j = 0
+while j < 5:
     emitir_beep(600, 100)
     time.sleep_ms(300)
-    mostrar(f"Di 'SI' (Muestra {j+1}/5)", "¡AHORA!")
+    mostrar(f"Di 'SI' ({j+1}/5)", "¡HABLA AHORA!")
     emitir_beep(800, 150)
     
-    zcr, hlr = grabar_muestra()
+    res = grabar_y_obtener_picos(umbral_ruido)
+    if res is None:
+        mostrar("NO ESCUCHE", "Repitiendo intento")
+        emitir_beep(400, 400)
+        time.sleep(1.5)
+        continue
+        
+    zcr, hi = res
     muestras_si_zcr.append(zcr)
-    muestras_si_hlr.append(hlr)
-    
-    mostrar("¡Guardada!", f"ZCR:{zcr:.1f}% H:{hlr:.1f}")
+    muestras_si_hi.append(hi)
+    mostrar("¡Guardada!", f"P-ZCR:{zcr:.1f}% P-HI:{hi:.1f}")
+    j += 1
     time.sleep(1.8)
 
-# Calibración para NO
-for j in range(5):
+# Calibrar NO
+j = 0
+while j < 5:
     emitir_beep(600, 100)
     time.sleep_ms(300)
-    mostrar(f"Di 'NO' (Muestra {j+1}/5)", "¡AHORA!")
+    mostrar(f"Di 'NO' ({j+1}/5)", "¡HABLA AHORA!")
     emitir_beep(800, 150)
     
-    zcr, hlr = grabar_muestra()
+    res = grabar_y_obtener_picos(umbral_ruido)
+    if res is None:
+        mostrar("NO ESCUCHE", "Repitiendo intento")
+        emitir_beep(400, 400)
+        time.sleep(1.5)
+        continue
+        
+    zcr, hi = res
     muestras_no_zcr.append(zcr)
-    muestras_no_hlr.append(hlr)
-    
-    mostrar("¡Guardada!", f"ZCR:{zcr:.1f}% H:{hlr:.1f}")
+    muestras_no_hi.append(hi)
+    mostrar("¡Guardada!", f"P-ZCR:{zcr:.1f}% P-HI:{hi:.1f}")
+    j += 1
     time.sleep(1.8)
 
 # ==========================================
-# 5. CALCULO DE CENTROIDES (Modelo de Distancia Mínima)
+# 6. CALCULAR PERFILES DE PICO
 # ==========================================
 centroid_si_zcr = sum(muestras_si_zcr) / len(muestras_si_zcr)
-centroid_si_hlr = sum(muestras_si_hlr) / len(muestras_si_hlr)
+centroid_si_hi = sum(muestras_si_hi) / len(muestras_si_hi)
 
 centroid_no_zcr = sum(muestras_no_zcr) / len(muestras_no_zcr)
-centroid_no_hlr = sum(muestras_no_hlr) / len(muestras_no_hlr)
+centroid_no_hi = sum(muestras_no_hi) / len(muestras_no_hi)
 
-print("\n=== Centroides Calculados ===")
-print(f"Centroide 'SI' ➡ ZCR: {centroid_si_zcr:.2f}%, HLR: {centroid_si_hlr:.2f}")
-print(f"Centroide 'NO' ➡ ZCR: {centroid_no_zcr:.2f}%, HLR: {centroid_no_hlr:.2f}")
+print("\n=== Centroides de Pico de Frecuencia ===")
+print(f"SI ➡ ZCR Pico: {centroid_si_zcr:.2f}%, Energía Pico: {centroid_si_hi:.2f}")
+print(f"NO ➡ ZCR Pico: {centroid_no_zcr:.2f}%, Energía Pico: {centroid_no_hi:.2f}")
 
 config = {
     "si_zcr": centroid_si_zcr,
-    "si_hlr": centroid_si_hlr,
+    "si_hlr": centroid_si_hi,  # Mapeado a si_hlr para compatibilidad
     "no_zcr": centroid_no_zcr,
-    "no_hlr": centroid_no_hlr
+    "no_hlr": centroid_no_hi   # Mapeado a no_hlr para compatibilidad
 }
 
 try:
     with open("config_voz.json", "w") as f:
         json.dump(config, f)
-    mostrar("¡CALIBRADO!", "Datos guardados")
-    print("Configuración guardada en 'config_voz.json'.")
+    mostrar("¡CALIBRADO!", "Perfil guardado")
+    print("Configuración guardada en '/config_voz.json'.")
 except Exception as e:
     mostrar("Error al guardar", str(e))
 
