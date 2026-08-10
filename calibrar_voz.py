@@ -6,7 +6,7 @@ import json
 import gc
 import ssd1306
 
-print("=== Sistema de Calibración de Voz (SI / NO) ===")
+print("=== Sistema de Calibración Bidimensional de Voz (SI / NO) ===")
 
 # ==========================================
 # 1. HARDWARE
@@ -31,8 +31,11 @@ audio_in = I2S(
     mode=I2S.RX, bits=32, format=I2S.STEREO, rate=16000, ibuf=8000
 )
 
+# Array para guardar resultados acumulados de Viper: [zcr, hi_energy, lo_energy]
+dsp_results = array.array('i', [0, 0, 0])
+
 # ==========================================
-# 2. FUNCIONES DE MENSAJES Y BEEP
+# 2. MENSAJES Y TONOS
 # ==========================================
 def mostrar(linea1, linea2=""):
     if oled:
@@ -66,14 +69,21 @@ def emitir_beep(frecuencia=800, duracion_ms=150):
         pass
 
 # ==========================================
-# 3. PROCESAMIENTO DSP (VIPER)
+# 3. DSP ACELERADO (Extracción de 2 características)
 # ==========================================
 @micropython.viper
-def convert_and_extract_features(src_32: ptr32, length: int, channel: int) -> int:
-    zcr = 0
-    prev_val = 0
+def extract_dsp_features(src_32: ptr32, length: int, channel: int, shift_val: int, res: ptr32):
+    """
+    Calcula simultáneamente:
+    1. Cruces por cero (ZCR)
+    2. Energía de alta frecuencia (Filtro paso alto: diferencia)
+    3. Energía de baja frecuencia (Filtro paso bajo: suma)
+    """
     i = 0
-    shift_val = 14
+    zcr = 0
+    hi_energy = 0
+    lo_energy = 0
+    prev_val = 0
     
     while i < length:
         s32 = src_32[(i << 1) + channel]
@@ -84,90 +94,127 @@ def convert_and_extract_features(src_32: ptr32, length: int, channel: int) -> in
         elif s16 < -32768:
             s16 = -32768
             
+        # Cruces por cero
         if (prev_val >= 0 and s16 < 0) or (prev_val < 0 and s16 >= 0):
             zcr += 1
             
+        # Energía alta (Diferencia absoluta)
+        diff = s16 - prev_val
+        if diff < 0:
+            hi_energy += -diff
+        else:
+            hi_energy += diff
+            
+        # Energía baja (Suma absoluta)
+        summ = s16 + prev_val
+        if summ < 0:
+            lo_energy += -summ
+        else:
+            lo_energy += summ
+            
         prev_val = s16
         i += 1
-    return zcr
+        
+    res[0] = res[0] + zcr
+    res[1] = res[1] + hi_energy
+    res[2] = res[2] + lo_energy
 
 def grabar_muestra():
+    # Vaciar buffer
     flush = bytearray(1600)
     for _ in range(10):
         audio_in.readinto(flush)
         
+    # Grabamos durante 1.2 segundos (19,200 muestras)
     duracion_muestras = 19200
     temp_buf = bytearray(1024)
-    total_zcr = 0
-    muestras_leidas = 0
     
+    # Reiniciar acumuladores
+    dsp_results[0] = 0
+    dsp_results[1] = 0
+    dsp_results[2] = 0
+    
+    muestras_leidas = 0
     while muestras_leidas < duracion_muestras:
         bytes_read = audio_in.readinto(temp_buf)
         if bytes_read > 0:
             samples_read = bytes_read // 8
-            zcr = convert_and_extract_features(temp_buf, samples_read, 0)
-            total_zcr += zcr
+            extract_dsp_features(temp_buf, samples_read, 0, 14, dsp_results)
             muestras_leidas += samples_read
             
-    return (total_zcr / muestras_leidas) * 100
+    # Calcular características finales
+    zcr_percent = (dsp_results[0] / muestras_leidas) * 100
+    
+    hi = float(dsp_results[1])
+    lo = float(dsp_results[2])
+    # Ratio alta/baja frecuencia (HLR) escalada por 10 para igualar pesos en el espacio euclidiano
+    hlr_ratio = (hi / lo * 10.0) if lo > 0 else 0.0
+    
+    return zcr_percent, hlr_ratio
 
 # ==========================================
-# 4. CAPTURA DE SEÑAL
+# 4. CAPTURA DE CALIBRACIÓN (5 veces cada palabra)
 # ==========================================
 mostrar("Preparando...", "Espera")
 time.sleep(1)
 
-muestras_si = []
-muestras_no = []
+muestras_si_zcr = []
+muestras_si_hlr = []
+muestras_no_zcr = []
+muestras_no_hlr = []
 
-for j in range(4):
+# Calibración para SÍ
+for j in range(5):
     emitir_beep(600, 100)
     time.sleep_ms(300)
-    mostrar(f"Di 'SI' (Muestra {j+1}/4)", "¡AHORA!")
+    mostrar(f"Di 'SI' (Muestra {j+1}/5)", "¡AHORA!")
     emitir_beep(800, 150)
     
-    zcr = grabar_muestra()
-    muestras_si.append(zcr)
+    zcr, hlr = grabar_muestra()
+    muestras_si_zcr.append(zcr)
+    muestras_si_hlr.append(hlr)
     
-    mostrar("¡Guardada!", f"Frec: {zcr:.1f}%")
-    time.sleep(2)
+    mostrar("¡Guardada!", f"ZCR:{zcr:.1f}% H:{hlr:.1f}")
+    time.sleep(1.8)
 
-for j in range(4):
+# Calibración para NO
+for j in range(5):
     emitir_beep(600, 100)
     time.sleep_ms(300)
-    mostrar(f"Di 'NO' (Muestra {j+1}/4)", "¡AHORA!")
+    mostrar(f"Di 'NO' (Muestra {j+1}/5)", "¡AHORA!")
     emitir_beep(800, 150)
     
-    zcr = grabar_muestra()
-    muestras_no.append(zcr)
+    zcr, hlr = grabar_muestra()
+    muestras_no_zcr.append(zcr)
+    muestras_no_hlr.append(hlr)
     
-    mostrar("¡Guardada!", f"Frec: {zcr:.1f}%")
-    time.sleep(2)
+    mostrar("¡Guardada!", f"ZCR:{zcr:.1f}% H:{hlr:.1f}")
+    time.sleep(1.8)
 
 # ==========================================
-# 5. AJUSTE DE CONFIGURACIÓN
+# 5. CALCULO DE CENTROIDES (Modelo de Distancia Mínima)
 # ==========================================
-promedio_si = sum(muestras_si) / len(muestras_si)
-promedio_no = sum(muestras_no) / len(muestras_no)
-umbral_optimo = (promedio_si + promedio_no) / 2
+centroid_si_zcr = sum(muestras_si_zcr) / len(muestras_si_zcr)
+centroid_si_hlr = sum(muestras_si_hlr) / len(muestras_si_hlr)
 
-print("\n=== Resultados de Calibración ===")
-print(f"Frecuencia (ZCR) de 'SI': {muestras_si}")
-print(f"Frecuencia (ZCR) de 'NO': {muestras_no}")
-print(f"Promedio SI: {promedio_si:.2f}%")
-print(f"Promedio NO: {promedio_no:.2f}%")
-print(f"Umbral de corte: {umbral_optimo:.2f}%")
+centroid_no_zcr = sum(muestras_no_zcr) / len(muestras_no_zcr)
+centroid_no_hlr = sum(muestras_no_hlr) / len(muestras_no_hlr)
+
+print("\n=== Centroides Calculados ===")
+print(f"Centroide 'SI' ➡ ZCR: {centroid_si_zcr:.2f}%, HLR: {centroid_si_hlr:.2f}")
+print(f"Centroide 'NO' ➡ ZCR: {centroid_no_zcr:.2f}%, HLR: {centroid_no_hlr:.2f}")
 
 config = {
-    "umbral_zcr": umbral_optimo,
-    "promedio_si": promedio_si,
-    "promedio_no": promedio_no
+    "si_zcr": centroid_si_zcr,
+    "si_hlr": centroid_si_hlr,
+    "no_zcr": centroid_no_zcr,
+    "no_hlr": centroid_no_hlr
 }
 
 try:
     with open("config_voz.json", "w") as f:
         json.dump(config, f)
-    mostrar("¡CALIBRADO!", f"Corte: {umbral_optimo:.1f}%")
+    mostrar("¡CALIBRADO!", "Datos guardados")
     print("Configuración guardada en 'config_voz.json'.")
 except Exception as e:
     mostrar("Error al guardar", str(e))
